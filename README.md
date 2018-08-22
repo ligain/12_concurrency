@@ -1,0 +1,1 @@
+sudo apt install memcached python-protobuf protobuf-compiler
