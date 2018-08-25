@@ -46,7 +46,7 @@ def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
 
 
 def parse_appsinstalled(line):
-    line_parts = line.strip().split("\t")
+    line_parts = line.strip().decode().split("\t")
     if len(line_parts) < 5:
         return
     dev_type, dev_id, lat, lon, raw_apps = line_parts
