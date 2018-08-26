@@ -29,14 +29,6 @@ def dot_rename(path):
 
 
 def insert_appsinstalled(queue, processed, errors, dry_run=False):
-    # ua = appsinstalled_pb2.UserApps()
-    # ua.lat = appsinstalled.lat
-    # ua.lon = appsinstalled.lon
-    # key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
-    # ua.apps.extend(appsinstalled.apps)
-    # packed = ua.SerializeToString()
-    # @TODO persistent connection
-    # @TODO retry and timeouts!
     while True:
         item = queue.get()
         if item is None:
@@ -98,7 +90,6 @@ def generate_appsinstalled(file_descriptor, queue, device_memc, errors):
         ua.apps.extend(appsinstalled.apps)
         packed = ua.SerializeToString()
         queue.put((memc_addr, key, packed))
-        logging.info("put in queue: {}".format((memc_addr, key)))
 
 
 def main(options):
@@ -110,48 +101,31 @@ def main(options):
         "dvid": options.dvid,
     }
     for fn in glob.iglob(options.pattern):
-        # processed = errors = 0
         processed = multiprocessing.Value('i', 0)
         errors = multiprocessing.Value('i', 0)
         logging.info('Processing %s' % fn)
         fd = gzip.open(fn)
 
-        prod_proc = multiprocessing.Process(target=generate_appsinstalled, args=(fd, queue, device_memc, errors))
-        cons_proc = multiprocessing.Process(target=insert_appsinstalled, args=(queue, processed, errors), kwargs=({'dry_run': options.dry}))
+        produce_appsinstalled = multiprocessing.Process(
+            target=generate_appsinstalled,
+            args=(fd, queue, device_memc, errors)
+        )
+        save_appsinstalled = multiprocessing.Process(
+            target=insert_appsinstalled,
+            args=(queue, processed, errors),
+            kwargs=({'dry_run': options.dry})
+        )
 
-        prod_proc.start()
-        cons_proc.start()
+        produce_appsinstalled.start()
+        save_appsinstalled.start()
 
-        prod_proc.join()
-        queue.put(None)
-        cons_proc.join()
-
-        # for line in fd:
-        #     line = line.strip()
-        #     if not line:
-        #         continue
-        #     appsinstalled = parse_appsinstalled(line)
-        #     if not appsinstalled:
-        #         errors += 1
-        #         continue
-        #     memc_addr = device_memc.get(appsinstalled.dev_type)
-        #     if not memc_addr:
-        #         errors += 1
-        #         logging.error("Unknown device type: %s" % appsinstalled.dev_type)
-        #         continue
-        #     ok = insert_appsinstalled(memc_addr, appsinstalled, options.dry)
-        #     if ok:
-        #         processed += 1
-        #     else:
-        #         errors += 1
-        # if not processed:
-        #     fd.close()
-        #     dot_rename(fn)
-        #     continue
+        produce_appsinstalled.join()
+        queue.put(None)         # sentinel
+        save_appsinstalled.join()
 
         err_rate = float(errors.value) / processed.value
         if err_rate < NORMAL_ERR_RATE:
-            logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
+            logging.info("Acceptable error rate (%s). Successful load" % err_rate)
         else:
             logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
         fd.close()
