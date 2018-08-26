@@ -10,6 +10,10 @@ from optparse import OptionParser
 # brew install protobuf
 # protoc  --python_out=. ./appsinstalled.proto
 # pip install protobuf
+import time
+
+import multiprocessing
+
 import appsinstalled_pb2
 # pip install python3-memcached
 import memcache
@@ -24,25 +28,32 @@ def dot_rename(path):
     os.rename(path, os.path.join(head, "." + fn))
 
 
-def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
-    ua = appsinstalled_pb2.UserApps()
-    ua.lat = appsinstalled.lat
-    ua.lon = appsinstalled.lon
-    key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
-    ua.apps.extend(appsinstalled.apps)
-    packed = ua.SerializeToString()
+def insert_appsinstalled(queue, processed, errors, dry_run=False):
+    # ua = appsinstalled_pb2.UserApps()
+    # ua.lat = appsinstalled.lat
+    # ua.lon = appsinstalled.lon
+    # key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
+    # ua.apps.extend(appsinstalled.apps)
+    # packed = ua.SerializeToString()
     # @TODO persistent connection
     # @TODO retry and timeouts!
-    try:
-        if dry_run:
-            logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
-        else:
-            memc = memcache.Client([memc_addr])
-            memc.set(key, packed)
-    except Exception as e:
-        logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
-        return False
-    return True
+    while True:
+        item = queue.get()
+        if item is None:
+          break
+        memc_addr, key, packed = item
+        try:
+            if dry_run:
+                logging.debug("%s -> %s" % (memc_addr, key))
+            else:
+                memc = memcache.Client([memc_addr], socket_timeout=1)
+                memc.set(key, packed)
+        except Exception as e:
+            logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
+            with errors.get_lock():
+                errors.value += 1
+        with processed.get_lock():
+            processed.value += 1
 
 
 def parse_appsinstalled(line):
@@ -64,7 +75,34 @@ def parse_appsinstalled(line):
     return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
+def generate_appsinstalled(file_descriptor, queue, device_memc, errors):
+    for line in file_descriptor:
+        line = line.strip()
+        if not line:
+            continue
+        appsinstalled = parse_appsinstalled(line)
+        if not appsinstalled:
+            with errors.get_lock():
+                errors.value += 1
+            continue
+        memc_addr = device_memc.get(appsinstalled.dev_type)
+        if not memc_addr:
+            with errors.get_lock():
+                errors.value += 1
+            logging.error("Unknown device type: %s" % appsinstalled.dev_type)
+            continue
+        ua = appsinstalled_pb2.UserApps()
+        ua.lat = appsinstalled.lat
+        ua.lon = appsinstalled.lon
+        key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
+        ua.apps.extend(appsinstalled.apps)
+        packed = ua.SerializeToString()
+        queue.put((memc_addr, key, packed))
+        logging.info("put in queue: {}".format((memc_addr, key)))
+
+
 def main(options):
+    queue = multiprocessing.Queue()
     device_memc = {
         "idfa": options.idfa,
         "gaid": options.gaid,
@@ -72,33 +110,46 @@ def main(options):
         "dvid": options.dvid,
     }
     for fn in glob.iglob(options.pattern):
-        processed = errors = 0
+        # processed = errors = 0
+        processed = multiprocessing.Value('i', 0)
+        errors = multiprocessing.Value('i', 0)
         logging.info('Processing %s' % fn)
         fd = gzip.open(fn)
-        for line in fd:
-            line = line.strip()
-            if not line:
-                continue
-            appsinstalled = parse_appsinstalled(line)
-            if not appsinstalled:
-                errors += 1
-                continue
-            memc_addr = device_memc.get(appsinstalled.dev_type)
-            if not memc_addr:
-                errors += 1
-                logging.error("Unknow device type: %s" % appsinstalled.dev_type)
-                continue
-            ok = insert_appsinstalled(memc_addr, appsinstalled, options.dry)
-            if ok:
-                processed += 1
-            else:
-                errors += 1
-        if not processed:
-            fd.close()
-            dot_rename(fn)
-            continue
 
-        err_rate = float(errors) / processed
+        prod_proc = multiprocessing.Process(target=generate_appsinstalled, args=(fd, queue, device_memc, errors))
+        cons_proc = multiprocessing.Process(target=insert_appsinstalled, args=(queue, processed, errors), kwargs=({'dry_run': options.dry}))
+
+        prod_proc.start()
+        cons_proc.start()
+
+        prod_proc.join()
+        queue.put(None)
+        cons_proc.join()
+
+        # for line in fd:
+        #     line = line.strip()
+        #     if not line:
+        #         continue
+        #     appsinstalled = parse_appsinstalled(line)
+        #     if not appsinstalled:
+        #         errors += 1
+        #         continue
+        #     memc_addr = device_memc.get(appsinstalled.dev_type)
+        #     if not memc_addr:
+        #         errors += 1
+        #         logging.error("Unknown device type: %s" % appsinstalled.dev_type)
+        #         continue
+        #     ok = insert_appsinstalled(memc_addr, appsinstalled, options.dry)
+        #     if ok:
+        #         processed += 1
+        #     else:
+        #         errors += 1
+        # if not processed:
+        #     fd.close()
+        #     dot_rename(fn)
+        #     continue
+
+        err_rate = float(errors.value) / processed.value
         if err_rate < NORMAL_ERR_RATE:
             logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
         else:
@@ -135,14 +186,17 @@ if __name__ == '__main__':
     op.add_option("--dvid", action="store", default="127.0.0.1:33016")
     (opts, args) = op.parse_args()
     logging.basicConfig(filename=opts.log, level=logging.INFO if not opts.dry else logging.DEBUG,
-                        format='[%(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
+                        format='[%(processName)s %(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
     if opts.test:
         prototest()
         sys.exit(0)
 
     logging.info("Memc loader started with options: %s" % opts)
     try:
+        start = time.perf_counter()
         main(opts)
+        end = time.perf_counter()
+        logging.info("Script completed in: {} sec".format(end - start))
     except Exception as e:
         logging.exception("Unexpected error: %s" % e)
         sys.exit(1)
