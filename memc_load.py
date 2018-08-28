@@ -130,7 +130,6 @@ class ProcessFile(multiprocessing.Process):
 
 
 def main(options):
-    # queue = multiprocessing.Queue()
     device_memc = {
         "idfa": options.idfa,
         "gaid": options.gaid,
