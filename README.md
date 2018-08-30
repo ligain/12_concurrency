@@ -40,13 +40,13 @@ sys 0m52.976s
 ```
 $ python memc_load.py --pattern=/path/to/datafiles/*tsv.gz --dry
 ...
-[ProcessFile-2 MainThread 2018.08.28 22:26:51] I Acceptable error rate (0.0). Successful load
-[ProcessFile-2 MainThread 2018.08.28 22:26:51] I Processed lines: 3424477
-[MainProcess MainThread 2018.08.28 22:26:51] I Script completed in: 500.29375287899893 sec
+[ProcessFile-2 MainThread 2018.08.30 18:05:42] I Acceptable error rate (0.0). Successful load
+[ProcessFile-2 MainThread 2018.08.30 18:05:42] I Processed lines: 3424477
+[MainProcess MainThread 2018.08.30 18:05:42] I Script completed in: 575.8028435859997 sec
 
-real	8m20.525s
-user	17m35.976s
-sys	2m8.520s
+real	9m36.030s
+user	21m38.720s
+sys	2m29.360s
 ```
 
 ### Project Goals

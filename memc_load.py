@@ -85,7 +85,6 @@ class ProcessFile(multiprocessing.Process):
                 ua.apps.extend(appsinstalled.apps)
                 packed = ua.SerializeToString()
                 yield memc_addr, key, packed
-                # self.queue.put((memc_addr, key, packed))
         finally:
             file_descriptor.close()
 
