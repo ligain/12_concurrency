@@ -16,7 +16,7 @@ import multiprocessing
 from queue import Queue
 
 import appsinstalled_pb2
-# pip install python3-memcached
+# pip install python-memcached
 import memcache
 
 NORMAL_ERR_RATE = 0.01
@@ -61,29 +61,37 @@ class ProcessFile(multiprocessing.Process):
             logging.info("Invalid geo coords: `%s`" % line)
         return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
-    def read_file(self):
-        for line in self.file_descriptor:
-            line = line.strip()
-            if not line:
-                continue
-            appsinstalled = self.parse_appsinstalled(line)
-            if not appsinstalled:
-                with self.errors_lock:
-                    self.errors += 1
-                continue
-            memc_addr = self.device_memc.get(appsinstalled.dev_type)
-            if not memc_addr:
-                with self.errors_lock:
-                    self.errors += 1
-                logging.error("Unknown device type: %s" % appsinstalled.dev_type)
-                continue
-            ua = appsinstalled_pb2.UserApps()
-            ua.lat = appsinstalled.lat
-            ua.lon = appsinstalled.lon
-            key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
-            ua.apps.extend(appsinstalled.apps)
-            packed = ua.SerializeToString()
-            self.queue.put((memc_addr, key, packed))
+    def read_file(self, file_descriptor):
+        try:
+            for line in file_descriptor:
+                line = line.strip()
+                if not line:
+                    continue
+                appsinstalled = self.parse_appsinstalled(line)
+                if not appsinstalled:
+                    with self.errors_lock:
+                        self.errors += 1
+                    continue
+                memc_addr = self.device_memc.get(appsinstalled.dev_type)
+                if not memc_addr:
+                    with self.errors_lock:
+                        self.errors += 1
+                    logging.error("Unknown device type: %s" % appsinstalled.dev_type)
+                    continue
+                ua = appsinstalled_pb2.UserApps()
+                ua.lat = appsinstalled.lat
+                ua.lon = appsinstalled.lon
+                key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
+                ua.apps.extend(appsinstalled.apps)
+                packed = ua.SerializeToString()
+                yield memc_addr, key, packed
+                # self.queue.put((memc_addr, key, packed))
+        finally:
+            file_descriptor.close()
+
+    def put_data_in_queue(self):
+        for item in self.read_file(self.file_descriptor):
+            self.queue.put(item)
 
     def write_data(self):
         while True:
@@ -96,7 +104,11 @@ class ProcessFile(multiprocessing.Process):
                     logging.debug("%s -> %s" % (memc_addr, key))
                 else:
                     memc = memcache.Client([memc_addr], socket_timeout=1)
-                    memc.set(key, packed)
+                    write_status = memc.set(key, packed)
+                    if not write_status:
+                        with self.errors_lock:
+                            self.errors += 1
+                    logging.info("Item %s saved with return code: %s" % (key, write_status))
             except Exception as e:
                 logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
                 with self.errors_lock:
@@ -105,7 +117,12 @@ class ProcessFile(multiprocessing.Process):
                 self.processed += 1
 
     def run(self):
-        self.read_file()
+        queue_writer = threading.Thread(
+            name='queue_writer',
+            target=self.put_data_in_queue
+        )
+        queue_writer.start()
+
         for writerno in range(self.writer_threads):
             writer = threading.Thread(
                 name='writer-thread-{}'.format(writerno),
@@ -114,6 +131,7 @@ class ProcessFile(multiprocessing.Process):
             writer.start()
             self.writers.append(writer)
 
+        queue_writer.join()
         # stop writers
         for _ in range(self.writer_threads):
             self.queue.put(None)
