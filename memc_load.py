@@ -30,13 +30,13 @@ def dot_rename(path):
 
 
 class ProcessFile(multiprocessing.Process):
-    def __init__(self, file_descriptor, device_memc, writer_threads=4, dry_run=False):
+    def __init__(self, file_descriptor, device_memc, dry_run=False):
         multiprocessing.Process.__init__(self)
         self.file_descriptor = file_descriptor
         self.device_memc = device_memc
+        self.memc_queues = {memc_addr: Queue()
+                            for memc_addr in self.device_memc.values()}
         self.dry_run = dry_run
-        self.writer_threads = writer_threads
-        self.queue = Queue()
         self.writers = []
         self.errors = 0
         self.processed = 0
@@ -88,52 +88,52 @@ class ProcessFile(multiprocessing.Process):
         finally:
             file_descriptor.close()
 
-    def put_data_in_queue(self):
-        for item in self.read_file(self.file_descriptor):
-            self.queue.put(item)
+    def put_data_in_queues(self):
+        for memc_addr, key, packed in self.read_file(self.file_descriptor):
+            q = self.memc_queues.get(memc_addr)
+            if q:
+                q.put((memc_addr, key, packed))
+            else:
+                logging.error("Unknown memc addr: {}".format(memc_addr))
 
-    def write_data(self):
+    def write_data(self, memc_conn_addr, queue):
+        memc = memcache.Client([memc_conn_addr], socket_timeout=1)
         while True:
-            item = self.queue.get()
+            item = queue.get()
             if item is None:
                 break
             memc_addr, key, packed = item
-            try:
-                if self.dry_run:
-                    logging.debug("%s -> %s" % (memc_addr, key))
-                else:
-                    memc = memcache.Client([memc_addr], socket_timeout=1)
-                    write_status = memc.set(key, packed)
-                    if not write_status:
-                        with self.errors_lock:
-                            self.errors += 1
-                    logging.info("Item %s saved with return code: %s" % (key, write_status))
-            except Exception as e:
-                logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
-                with self.errors_lock:
-                    self.errors += 1
+            if self.dry_run:
+                logging.debug("%s -> %s" % (memc_addr, key))
+            else:
+                write_status = memc.set(key, packed)
+                if not write_status:
+                    with self.errors_lock:
+                        self.errors += 1
+                logging.info("Item %s saved with return code: %s" % (key, write_status))
             with self.processed_lock:
                 self.processed += 1
 
     def run(self):
         queue_writer = threading.Thread(
             name='queue_writer',
-            target=self.put_data_in_queue
+            target=self.put_data_in_queues
         )
         queue_writer.start()
 
-        for writerno in range(self.writer_threads):
+        for memc_addr, memc_queue in self.memc_queues.items():
             writer = threading.Thread(
-                name='writer-thread-{}'.format(writerno),
-                target=self.write_data
+                name='memc-writer-{}'.format(memc_addr),
+                target=self.write_data,
+                args=(memc_addr, memc_queue)
             )
             writer.start()
             self.writers.append(writer)
 
         queue_writer.join()
         # stop writers
-        for _ in range(self.writer_threads):
-            self.queue.put(None)
+        for memc_queue in self.memc_queues.values():
+            memc_queue.put(None)
 
         for writer in self.writers:
             writer.join()
